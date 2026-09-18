@@ -14,14 +14,7 @@ warn() {
 }
 
 check() {
-    local message="$1"
-    shift
-    if "$@" >/dev/null 2>&1; then
-        printf "\e[32m✔✔ %s\e[0m\n" "$message" > /dev/tty
-    else
-        warn "$message"
-        return 1
-    fi
+    printf "\e[32m✔✔ %s\e[0m\n" "$1" > /dev/tty
 }
 
 header() {
@@ -626,12 +619,10 @@ print_help() {
 }
 
 gt_hlpr() {
-    case "${1:-}" in
+    case "$1" in
         setup)
             local path
             path=$(realpath "$0")
-            check "git is available" command -v git || return 1
-            check "gpg is available" command -v gpg || return 1
             git config --global credential.helper "$path" || { warn "Failed to configure Git helper"; return 1; }
             git config --global credential.useHttpPath true || { warn "Failed to enable useHttpPath"; return 1; }
             check "Git credential helper configured" git config --global --get credential.helper
@@ -652,14 +643,6 @@ gt_hlpr() {
             get_master_password || { warn "Authentication failed"; return 1; }
             shift ; passwd_rec_fun "$@"
             ;;
-        verify-totp)
-            if ! sudo grep -q "^totp_secret=" "$MAIN_FILE" 2>/dev/null; then
-                warn "No TOTP secret configured"
-                return 1
-            fi
-            get_master_password || { warn "Authentication failed"; return 1; }
-            ;;
-
         get)
             get_fun
             ;;

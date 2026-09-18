@@ -1,0 +1,687 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+MAIN_DIR="${GTHLPR_DIR:-/etc/gthlpr}"
+MAIN_FILE="$MAIN_DIR/gthlpr"
+
+info() {
+    printf "\e[32m%s\e[0m\n" "$1" > /dev/tty
+}
+
+warn() {
+    printf "\e[31m⚠ %s\e[0m\n" "$1" > /dev/tty
+}
+
+check() {
+    local message="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then
+        printf "\e[32m✔✔ %s\e[0m\n" "$message" > /dev/tty
+    else
+        warn "$message"
+        return 1
+    fi
+}
+
+header() {
+    printf 'REPO%sUSERNAME%sTOKEN\n' "$(printf '=%.0s' {1..40})" "$(printf '=%.0s' {1..40})"
+}
+
+require_cmd() {
+    local -a missing=()
+    local pm
+
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    ((${#missing[@]})) || return 0
+
+    warn "Missing commands: ${missing[*]}"
+    for pm in dnf apt pacman zypper apk emerge xbps-install; do
+        if command -v "$pm" >/dev/null 2>&1; then
+            info "Install with: sudo $pm install ${missing[*]}"
+            printf "Press Enter to run, anything else to quit: " > /dev/tty
+            local reply
+            read -r reply < /dev/tty
+            [[ -z "$reply" ]] && sudo "$pm" install "${missing[@]}"
+            return $?
+        fi
+    done
+
+    warn "Please install the missing commands manually"
+    return 1
+}
+
+require_cmd gpg sudo base64
+
+# ==================================================
+#   Initialization
+# ==================================================
+
+if [[ ! -f "$MAIN_FILE" ]]; then
+
+    info "Welcome to gthlpr"
+    info "Enter your sudo password to get started"
+
+    info "=================================================="
+    info "Please be aware you tokens will be encrypted and decrypted using your sudo password"
+    info "incase you forget your password you have an option to use 'gthlpr passwd_rec gen' which will create "
+    info "a recovery file that you can use later with 'gthlpr passwd_rec frgt' to print your old sudo password"
+    info "or use 'gthlpr export frgt' to walk you throught how to decrypt your tokens then you can decrypt it using your new passwd"
+    info "use 'gthlpr -h' to see all available commands"
+    info "=================================================="
+
+    sudo -v || { warn "sudo authentication failed"; exit 1; }
+
+    sudo mkdir -p "$MAIN_DIR" || { warn "Failed to create $MAIN_DIR"; exit 1; }
+    sudo touch "$MAIN_FILE" || { warn "Failed to create $MAIN_FILE"; exit 1; }
+
+    {
+        printf '%s\n' \
+            'msg:Well hello there a little project because my brain does not want to be responsible with tokens' \
+            'Ahhhhhh really laziness is one of the big reasons civilizations exists'
+        header
+    } | sudo tee "$MAIN_FILE" >/dev/null || { warn "Failed to write initial $MAIN_FILE contents"; exit 1; }
+
+    sudo chown root:root "$MAIN_FILE" || { warn "Failed to set ownership on $MAIN_FILE"; exit 1; }
+    sudo chmod 600 "$MAIN_FILE" || { warn "Failed to set permissions on $MAIN_FILE"; exit 1; }
+    info "File permissions set to root:root with 600 permissions"
+
+    info "Created $MAIN_FILE"
+fi
+
+# ==================================================
+#   Master password
+# ==================================================
+
+get_master_password() {
+    while true; do
+        printf "Enter Master Password (sudo password): " > /dev/tty
+        read -rs master_password < /dev/tty
+        printf "\n" > /dev/tty
+
+        if printf '%s\n' "$master_password" |
+            sudo -S -v >/dev/null 2>/dev/null
+        then
+            break
+        fi
+
+        warn "Password does not match sudo password"
+    done
+
+    if sudo grep -q "^totp_secret=" "$MAIN_FILE" 2>/dev/null; then
+        verify_totp || return 1
+    fi
+
+    return 0
+}
+
+
+# ==================================================
+#   User input in case of unknown git repo
+# ==================================================
+
+user_choice() {
+    mapfile -t options
+    [[ ${#options[@]} -eq 0 ]] && warn "No options available" && exit 0
+    [[ ${#options[@]} -eq 1 ]] && echo "${options[0]}" && return 0
+
+    local selected first_draw key
+    selected=0
+    first_draw=1
+
+    draw_menu() {
+        if [[ $first_draw -eq 0 ]]; then
+            printf "\e[%dA" \
+                "$(( ${#options[@]} + 1 ))" > /dev/tty
+
+            for ((i = 0; i < ${#options[@]} + 1 ; i++)); do
+                printf "\e[2K\n" > /dev/tty
+            done
+
+            printf "\e[%dA" \
+                "$(( ${#options[@]} + 1 ))" > /dev/tty
+        fi
+
+        first_draw=0
+
+        printf "%bEnter to select, z for fuzzy search%b." "\e[38;2;100;135;85m" "\e[0m\n" > /dev/tty
+
+        for i in "${!options[@]}"; do
+            if [[ $i -eq $selected ]]; then
+                printf \
+                    "\e[48;2;130;100;170m \e[38;2;0;0;0m > \e[38;2;255;255;255m %s \e[0m\n" \
+                    "${options[$i]}" > /dev/tty
+            else
+                printf "   %s\n" \
+                    "${options[$i]}" > /dev/tty
+            fi
+        done
+    }
+
+    while true; do
+        draw_menu
+
+        IFS= read -rsn1 key < /dev/tty
+        if [[ "$key" == $'\e' ]]; then
+            IFS= read -rsn2 key_rest < /dev/tty
+            key+="$key_rest"
+        fi
+
+        case "$key" in
+            *A)
+                ((--selected))
+                if [[ $selected -lt 0 ]]; then
+                    selected=$((${#options[@]} - 1))
+                fi
+                ;;
+            *B)
+                ((++selected))
+                if [[ $selected -ge ${#options[@]} ]]; then
+                    selected=0
+                fi
+                ;;
+            z)
+                if ! command -v fzf >/dev/null 2>&1; then
+                    warn "fzf is not installed"
+                    continue
+                fi
+                printf "%s\n" "${options[@]}" | fzf && break
+                ;;
+            "")
+                echo "${options[$selected]}"
+                break
+                ;;
+        esac
+    done
+}
+
+# =================================================
+#   Export function
+# =================================================
+export_fun() {
+    local mode
+    mode=$(user_choice < <(echo "just a copy (a simple copy one to one)"
+    echo "plaintext (decrypt the file credentials)")) || { warn "No export mode selected"; return 1; }
+
+    info "mode: $mode"
+    printf "specify an output path (enter=~/export_gthlpr$(date +"%Y-%m-%d_%I:%M")):" > /dev/tty
+    read -r output_path < /dev/tty
+    local output_path="${output_path:-$HOME/export_gthlpr$(date +"%Y-%m-%d_%I:%M")}"
+    output_path="$(realpath -m "$output_path")"
+    mkdir -p "$(dirname "$output_path")" || { warn "Failed to create output directory"; return 1; }
+    touch "$output_path" || { warn "Failed to create $output_path"; return 1; }
+    info "output path created: $output_path"
+
+    get_master_password
+
+    if [[ "$mode" =~ "just a copy" ]]; then
+        sudo cp "$MAIN_FILE" "$output_path" || { warn "Copy failed"; return 1; }
+    elif [[ "$mode" =~ "plaintext" ]]; then
+        local repo username encrypted
+        local -a plain_passwd=() repos=() usernames=() encrypted_tokens=()
+        while IFS=$'\t' read -r repo username encrypted; do
+            [[ "$repo" =~ ^[^/]+/[^/]+\.git$ ]] || continue
+            repos+=("$repo")
+            usernames+=("$username")
+            encrypted_tokens+=("$encrypted")
+        done < <(sudo cat "$MAIN_FILE")
+
+        for i in "${!encrypted_tokens[@]}"; do
+            plain_passwd[i]=$(
+                printf '%s' "${encrypted_tokens[$i]}" |
+                    base64 -d |
+                    gpg --decrypt \
+                        --batch \
+                        --quiet \
+                        --pinentry-mode loopback \
+                        --passphrase-fd 3 \
+                        3<<<"$master_password" \
+                        2>/dev/null
+            ) || {
+                warn "Decryption failed"
+                return 1
+            }
+        done
+        header > "$output_path"
+        for i in "${!repos[@]}"; do
+            printf '%s\t%s\t%s\n' "${repos[$i]}" "${usernames[$i]}" "${plain_passwd[$i]}" >> "$output_path" || {
+                warn "Failed to write to $output_path"
+                return 1
+            }
+        done
+    fi
+    info "done exporting in a $mode format to $output_path"
+}
+
+# ==================================================
+# passwd_rec_fun
+# =================================================
+passwd_rec_fun() {
+    local mode="$1"
+    local passwd_phrase answers
+    if [[ -z "$mode" || ( "$mode" != "frgt" && "$mode" != "gen" ) ]]; then
+        warn "Invalid mode: $mode enter either 'frgt' or 'gen'"
+        return 1
+    fi
+
+    info "Answer the following questions:"
+
+    printf "What was the first meal you ever burned or ruined, and what exactly happened?: " > /dev/tty
+    read -r first_meal < /dev/tty
+    printf "What word, phrase, or name did you invent when you were young (that no one else used)?: " > /dev/tty
+    read -r invented_word < /dev/tty
+    printf "What's a family story or inside joke that only people in your household (or a close friend) would know?: " > /dev/tty
+    read -r family_story < /dev/tty
+
+    answers="$first_meal _%4#@ $invented_word //.-+= $family_story"
+
+    if [[ "$mode" == "frgt" ]]; then
+        local file_path="${2:-}"
+        while [[ -z "$file_path" ]]; do
+            printf "Enter the path to your password recovery file: " > /dev/tty
+            read -r file_path < /dev/tty
+        done
+        file_path=$(realpath "$file_path")
+        [[ -f "$file_path" ]] || { warn "File not found: $file_path"; return 1; }
+        local encrypted
+        encrypted=$(< "$file_path")
+        passwd_phrase=$(
+            printf '%s' "$encrypted" |
+                base64 -d |
+                gpg --decrypt \
+                    --batch \
+                    --quiet \
+                    --pinentry-mode loopback \
+                    --passphrase-fd 3 \
+                    3<<<"$answers" \
+                    2>/dev/null
+        ) || {
+            warn "Decryption failed check your answers"
+            return 1
+        }
+        info "Your password phrase save it this won't be saved by gthlpr"
+        printf "%s\n" "$passwd_phrase"
+    elif [[ "$mode" == "gen" ]]; then
+        local encrypted_passwd
+        encrypted_passwd=$(
+            printf '%s' "$master_password" |
+                gpg --symmetric \
+                    --batch \
+                    --quiet \
+                    --cipher-algo AES256 \
+                    --pinentry-mode loopback \
+                    --passphrase-fd 3 \
+                    3<<<"$answers" |
+                base64 -w0
+        ) || {
+            warn "Encryption failed"
+            return 1
+        }
+        if [[ -z "$encrypted_passwd" ]]; then
+            warn "Encryption failed"
+            return 1
+        fi
+        local rec_file="$HOME/gthlpren$(date +%Y%m%d_%I%M)"
+        printf "%s\n" "$encrypted_passwd" > "$rec_file" || { warn "Failed to write $rec_file"; return 1; }
+        info "Your password recovery password file is at $rec_file"
+    fi
+
+}
+
+# ==================================================
+# migrate_fun
+# =================================================
+migrate_fun() {
+    local passwd_phrase
+    passwd_phrase=$(passwd_rec_fun "frgt")
+    [[ -z "$passwd_phrase" ]] && return 1
+
+    printf "Enter the gthlpr credentials path: " > /dev/tty
+    read -r gt_path < /dev/tty
+
+    if [[ ! -f "$gt_path" ]]; then
+        warn "File not found: $gt_path"
+        return 1
+    fi
+
+    local encrypted username repo
+    declare -a plain_passwd new_encrypted repos=() usernames=() encrypted_tokens=()
+
+    while IFS=$'\t' read -r repo username encrypted; do
+        [[ "$repo" =~ ^[^/]+/[^/]+\.git$ ]] || continue
+        repos+=("$repo")
+        usernames+=("$username")
+        encrypted_tokens+=("$encrypted")
+    done < <(sudo cat "$gt_path")
+
+    for i in "${!encrypted_tokens[@]}"; do
+        plain_passwd[i]=$(
+            printf '%s' "${encrypted_tokens[$i]}" |
+                base64 -d |
+                gpg --decrypt \
+                    --batch \
+                    --quiet \
+                    --pinentry-mode loopback \
+                    --passphrase-fd 3 \
+                    3<<<"$passwd_phrase" \
+                    2>/dev/null
+        ) || {
+            warn "Decryption failed"
+            return 1
+        }
+    done
+
+    printf "Enter your new Master Password (sudo password): " > /dev/tty
+    read -rs new_passwd_phrase < /dev/tty
+    printf "\n" > /dev/tty
+    if ! printf '%s\n' "$new_passwd_phrase" | sudo -S -v >/dev/null 2>/dev/null; then
+        warn "Password does not match sudo password"
+        return 1
+    fi
+
+    for i in "${!plain_passwd[@]}"; do
+        new_encrypted[i]=$(
+            printf '%s' "${plain_passwd[$i]}" |
+                gpg --symmetric \
+                    --batch \
+                    --quiet \
+                    --cipher-algo AES256 \
+                    --pinentry-mode loopback \
+                    --passphrase-fd 3 \
+                    3<<<"$new_passwd_phrase" |
+                base64 -w0
+        ) || {
+            warn "Encryption failed"
+            return 1
+        }
+    done
+
+    {
+        printf '%s\n' \
+            'msg:Well hello there a little project because my brain does not want to be responsible with tokens' \
+            'Ahhhhhh really laziness is one of the big reasons civilizations exists'
+        header
+    } | sudo tee "$MAIN_FILE" >/dev/null || { warn "Failed to reset $MAIN_FILE"; return 1; }
+
+    for i in "${!repos[@]}"; do
+        sudo sh -c "printf '%s\t%s\t%s\n' '${repos[$i]}' '${usernames[$i]}' '${new_encrypted[$i]}' >> '$MAIN_FILE'" || {
+            warn "Failed to write migrated credential for ${repos[$i]}"
+            return 1
+        }
+    done
+    info "Credentials updated successfully now with your new sudo passwd"
+}
+
+
+# ==================================================
+#   Get credential
+# ==================================================
+
+get_fun() {
+    declare -A gt_input
+    local repo=""
+
+    while IFS='=' read -r key value; do
+        [[ -z "$key" ]] && break
+        gt_input["$key"]="$value"
+    done
+
+    if [[ -z "${gt_input["path"]:-}" ]]; then
+        info "No path specified. Please choose one:"
+
+        repo=$(user_choice < <(
+            while IFS=$'\t' read -r db_repo db_user db_token; do
+                [[ "$db_repo" =~ ^[^/]+/[^/]+\.git$ ]] && printf '%s\n' "$db_repo"
+            done < <(sudo cat "$MAIN_FILE")
+        ))
+    else
+        repo="${gt_input["path"]}"
+    fi
+
+
+    if [[ -n "$repo" ]] ;then
+        info "You selected: $repo"
+        get_master_password || { warn "Authentication failed"; return 1; }
+
+        local username="" encrypted="" dec_passwd
+
+        while IFS=$'\t' read -r db_repo db_user db_token; do
+            [[ "$db_repo" == "$repo" ]] || continue
+            username="$db_user"
+            encrypted="$db_token"
+            break
+        done < <(sudo cat "$MAIN_FILE")
+
+        if [[ -z "$encrypted" ]]; then
+            warn "No credential found for $repo"
+            return 1
+        fi
+
+
+        dec_passwd=$(
+            printf '%s' "$encrypted" |
+                base64 -d |
+                gpg --decrypt \
+                    --batch \
+                    --quiet \
+                    --pinentry-mode loopback \
+                    --passphrase-fd 3 \
+                    3<<<"$master_password" \
+                    2>/dev/null
+        ) || {
+            warn "Decryption failed"
+            return 1
+        }
+
+        printf "username=%s\npassword=%s\n\n" \
+            "$username" \
+            "$dec_passwd"
+    fi
+}
+
+# ==================================================
+#   Store credential
+# ==================================================
+
+store_fun() {
+    printf "%bSotring/updating credentials...\e[0m\n" "\e[38;2;100;135;85m" > /dev/tty
+    declare -A gt_input
+
+    while IFS='=' read -r key value; do
+        [[ -z "$key" ]] && break
+        gt_input["$key"]="$value"
+    done
+
+    local repo="${gt_input["path"]:-}"
+    local username="${gt_input["username"]:-}"
+    local token="${gt_input["password"]:-}"
+    local encrypted
+
+    if [[ -z "$repo" ]]; then
+        info "No repo name provided."
+        printf "Enter repo name you want to use ({owner}/{repo}.git): " > /dev/tty
+        read -r repo < /dev/tty
+    fi
+
+    if [[ -z "$repo" ||
+          -z "$username" ||
+          -z "$token" ]]
+    then
+        warn "Missing repository, username, or password"
+        return 1
+    fi
+
+    get_master_password || { warn "Authentication failed"; return 1; }
+
+    encrypted=$(
+        printf '%s' "$token" |
+            gpg --symmetric \
+                --batch \
+                --quiet \
+                --cipher-algo AES256 \
+                --pinentry-mode loopback \
+                --passphrase-fd 3 \
+                3<<<"$master_password" |
+            base64 -w0
+    ) || {
+        warn "Encryption failed"
+        return 1
+    }
+
+    if [[ -z "$encrypted" ]]; then
+        warn "Encryption failed"
+        return 1
+    fi
+
+    local tmp_file
+    tmp_file=$(mktemp) || { warn "Failed to create temp file"; return 1; }
+
+    {
+        while IFS=$'\t' read -r db_repo db_user db_token; do
+            if [[ "$db_repo" == "$repo" ]]; then
+                continue
+            elif [[ "$db_repo" =~ ^[^/]+/[^/]+\.git$ ]]; then
+                printf '%s\t%s\t%s\n' "$db_repo" "$db_user" "$db_token"
+            else
+                printf '%s\n' "$db_repo"
+            fi
+        done < <(sudo cat "$MAIN_FILE")
+        printf '%s\t%s\t%s\n' "$repo" "$username" "$encrypted"
+    } > "$tmp_file" || { warn "Failed to update credentials"; rm -f "$tmp_file"; return 1; }
+
+    sudo mv "$tmp_file" "$MAIN_FILE" || { warn "Failed to save $MAIN_FILE"; rm -f "$tmp_file"; return 1; }
+    sudo chown root:root "$MAIN_FILE" || { warn "Failed to set ownership on $MAIN_FILE"; return 1; }
+    sudo chmod 600 "$MAIN_FILE" || { warn "Failed to set permissions on $MAIN_FILE"; return 1; }
+
+    info "Credential stored for $repo"
+}
+
+# ==================================================
+#   Erase credential
+# ==================================================
+
+erase_fun() {
+    declare -A gt_input
+
+    while IFS='=' read -r key value; do
+        [[ -z "$key" ]] && break
+        gt_input["$key"]="$value"
+    done
+
+    local repo="${gt_input["path"]:-}"
+
+    [[ -z "$repo" ]] && return 0
+
+    local tmp_file found=0
+    tmp_file=$(mktemp) || { warn "Failed to create temp file"; return 1; }
+
+    {
+        while IFS=$'\t' read -r db_repo db_user db_token; do
+            if [[ "$db_repo" == "$repo" ]]; then
+                found=1
+                continue
+            fi
+            if [[ "$db_repo" =~ ^[^/]+/[^/]+\.git$ ]]; then
+                printf '%s\t%s\t%s\n' "$db_repo" "$db_user" "$db_token"
+            else
+                printf '%s\n' "$db_repo"
+            fi
+        done < <(sudo cat "$MAIN_FILE")
+    } > "$tmp_file"
+
+    if (( ! found )); then
+        rm -f "$tmp_file"
+        info "No credential found for $repo"
+        return 0
+    fi
+
+    sudo mv "$tmp_file" "$MAIN_FILE" || { warn "Failed to save $MAIN_FILE"; rm -f "$tmp_file"; return 1; }
+
+    sudo chown root:root "$MAIN_FILE" || { warn "Failed to set ownership on $MAIN_FILE"; return 1; }
+    sudo chmod 600 "$MAIN_FILE" || { warn "Failed to set permissions on $MAIN_FILE"; return 1; }
+
+    info "Credential erased for $repo"
+}
+
+# ==================================================
+#   Main
+# ==================================================
+
+print_help() {
+    printf '\e[1;36mgthlpr\e[0m - local encrypted Git credential helper\n\n' > /dev/tty
+    printf '\e[1;33mCommands\e[0m\n' > /dev/tty
+    printf '  \e[32msetup\e[0m             Configure gthlpr as Git credential helper\n' > /dev/tty
+    printf '  \e[32mget\e[0m               Get a credential (Git internal)\n' > /dev/tty
+    printf '  \e[32mstore\e[0m             Store/update a credential (Git internal)\n' > /dev/tty
+    printf '  \e[32merase\e[0m             Remove a credential (Git internal)\n' > /dev/tty
+    printf '  \e[32mexport\e[0m            Export the credential database\n' > /dev/tty
+    printf '  \e[32mmigrate\e[0m           Re-encrypt credentials with a new password\n' > /dev/tty
+    printf '  \e[32mpasswd_rec gen\e[0m    Create a password recovery file\n' > /dev/tty
+    printf '  \e[32mpasswd_rec frgt\e[0m   Recover the old password from a recovery file\n\n' > /dev/tty
+    printf '\e[1;33mExamples\e[0m\n' > /dev/tty
+    printf '  gthlpr setup\n  gthlpr -h\n\n' > /dev/tty
+    printf '\e[2mGit calls get/store/erase automatically.\e[0m\n' > /dev/tty
+}
+
+gt_hlpr() {
+    case "${1:-}" in
+        setup)
+            local path
+            path=$(realpath "$0")
+            check "git is available" command -v git || return 1
+            check "gpg is available" command -v gpg || return 1
+            git config --global credential.helper "$path" || { warn "Failed to configure Git helper"; return 1; }
+            git config --global credential.useHttpPath true || { warn "Failed to enable useHttpPath"; return 1; }
+            check "Git credential helper configured" git config --global --get credential.helper
+            check "Git path matching enabled" git config --global --get credential.useHttpPath
+            ;;
+        setup-totp)
+            get_master_password || { warn "Authentication failed"; return 1; }
+            gen_totp
+            ;;
+        migrate)
+            get_master_password || { warn "Authentication failed"; return 1; }
+            migrate_fun
+            ;;
+        export)
+            export_fun
+            ;;
+        passwd_rec)
+            get_master_password || { warn "Authentication failed"; return 1; }
+            shift ; passwd_rec_fun "$@"
+            ;;
+        verify-totp)
+            if ! sudo grep -q "^totp_secret=" "$MAIN_FILE" 2>/dev/null; then
+                warn "No TOTP secret configured"
+                return 1
+            fi
+            get_master_password || { warn "Authentication failed"; return 1; }
+            ;;
+
+        get)
+            get_fun
+            ;;
+
+        store)
+            store_fun
+            ;;
+
+        erase)
+            erase_fun
+            ;;
+
+        -h|help)
+            print_help
+            ;;
+
+        *)
+            warn "Unknown command: ${1:-}"
+            print_help
+            return 1
+            ;;
+    esac
+}
+
+gt_hlpr "$@"

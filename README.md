@@ -1,4 +1,4 @@
-                                              ﷽ 
+                                             ﷽ 
 # gthlpr
 
 `gthlpr` is a small Bash-based Git credential helper for Linux.

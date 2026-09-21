@@ -12,7 +12,7 @@ It manages Git credentials in a local protected database and integrates with Git
 * Encrypts stored tokens with GPG.
 * Uses the user's sudo password as the current master password.
  
-**- ⚠️ take care that if you lose your sudo password without a recovery file, you will not be able to recover your credentials.**
+**⚠️ take care that if you lose your sudo password without a recovery file, you will not be able to recover your credentials.**
 * Provides an interactive repository selector when Git does not provide a repository path.
 * Supports `fzf` as an alternative repository selector.
 * Provides credential export functionality.

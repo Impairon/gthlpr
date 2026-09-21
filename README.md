@@ -22,14 +22,12 @@ It manages Git credentials in a local protected database and integrates with Git
 
 gthlpr follows Git's credential-helper protocol.
 
-Git can send information such as:
+Git can send information such to get token as:
 
 ```text
 protocol=https
 host=github.com
 path=owner/repository.git
-username=username
-password=token
 ```
 
 For `get`, gthlpr returns:
